@@ -51,14 +51,16 @@ type question struct {
 	Content          string    `json:"content"`
 	Difficulty       string    `json:"difficulty"`
 	ExampleTestcases string    `json:"exampleTestcases"`
+	MetaData         string    `json:"metaData"`
 	CodeSnippets     []snippet `json:"codeSnippets"`
 }
 
 type meta struct {
-	Slug       string `json:"slug"`
-	QuestionID string `json:"question_id"`
-	Lang       string `json:"lang"`
-	File       string `json:"file"`
+	Slug       string   `json:"slug"`
+	QuestionID string   `json:"question_id"`
+	Lang       string   `json:"lang"`
+	File       string   `json:"file"`
+	Params     []string `json:"params,omitempty"`
 }
 
 type client struct {
@@ -137,7 +139,7 @@ func trunc(s string, n int) string {
 const questionQuery = `query q($titleSlug: String!) {
   question(titleSlug: $titleSlug) {
     questionId questionFrontendId title titleSlug content difficulty
-    exampleTestcases
+    exampleTestcases metaData
     codeSnippets { lang langSlug code }
   }
 }`
@@ -171,6 +173,9 @@ var (
 	slugRe  = regexp.MustCompile(`problems/([a-z0-9-]+)`)
 	supRe   = regexp.MustCompile(`(?s)<sup>(.*?)</sup>`)
 	blankRe = regexp.MustCompile(`\n{3,}`)
+
+	trailWSRe  = regexp.MustCompile(`(?m)[ \t]+$`)
+	punctGapRe = regexp.MustCompile("([`*]) +([.,;])")
 )
 
 func parseSlug(s string) string {
@@ -187,8 +192,12 @@ func htmlToText(s string) string {
 	if err != nil {
 		md = s
 	}
+	// Source HTML contains &nbsp;-only paragraphs. They become lines holding
+	// a single space, which defeats blank-line collapsing, so strip first.
 	md = strings.ReplaceAll(md, "\u00a0", " ")
+	md = trailWSRe.ReplaceAllString(md, "")
 	md = blankRe.ReplaceAllString(md, "\n\n")
+	md = punctGapRe.ReplaceAllString(md, "$1$2") // "`x` ." -> "`x`."
 	return strings.TrimSpace(md) + "\n"
 }
 
@@ -205,15 +214,29 @@ func pickSnippet(q *question, lang string) (*snippet, error) {
 	return nil, fmt.Errorf("lang %q unavailable; options: %s", lang, strings.Join(avail, ", "))
 }
 
+// parseInterleaved parses flags that may appear before, between, or after
+// positional arguments (the stdlib flag package stops at the first positional).
+func parseInterleaved(fs *flag.FlagSet, args []string) []string {
+	var pos []string
+	for {
+		fs.Parse(args)
+		if fs.NArg() == 0 {
+			return pos
+		}
+		pos = append(pos, fs.Arg(0))
+		args = fs.Args()[1:]
+	}
+}
+
 func cmdGet(args []string) error {
 	fs := flag.NewFlagSet("get", flag.ExitOnError)
-	lang := fs.String("l", "golang", "language slug (see `lc langs`)")
+	lang := fs.String("l", "python3", "language slug (see `lc langs`)")
 	out := fs.String("o", ".", "output base directory")
-	fs.Parse(args)
-	if fs.NArg() != 1 {
+	pos := parseInterleaved(fs, args)
+	if len(pos) != 1 {
 		return errors.New("usage: lc get <slug|url> [-l lang] [-o dir]")
 	}
-	slug := parseSlug(fs.Arg(0))
+	slug := parseSlug(pos[0])
 	c := newClient()
 	q, err := c.fetchQuestion(slug)
 	if err != nil {
@@ -232,9 +255,9 @@ func cmdGet(args []string) error {
 		return err
 	}
 	file := "solution." + ext
-	readme := fmt.Sprintf("# %s. %s\n\nDifficulty: %s\nURL: %s/problems/%s/\n\n%s",
+	readme := fmt.Sprintf("# %s. %s\n\n**Difficulty:** %s · [Problem link](%s/problems/%s/)\n\n%s",
 		q.FrontendID, q.Title, q.Difficulty, base, q.TitleSlug, htmlToText(q.Content))
-	m, _ := json.MarshalIndent(meta{Slug: q.TitleSlug, QuestionID: q.QuestionID, Lang: sn.LangSlug, File: file}, "", "  ")
+	m, _ := json.MarshalIndent(meta{Slug: q.TitleSlug, QuestionID: q.QuestionID, Lang: sn.LangSlug, File: file, Params: paramNames(q.MetaData)}, "", "  ")
 
 	files := []struct {
 		name, data string
@@ -282,11 +305,82 @@ func loadMeta(dir string) (*meta, string, error) {
 	if err := json.Unmarshal(b, &m); err != nil {
 		return nil, "", err
 	}
+	if len(m.Params) == 0 { // meta.json from an older `get`: backfill names
+		if q, err := newClient().fetchQuestion(m.Slug); err == nil {
+			if m.Params = paramNames(q.MetaData); len(m.Params) > 0 {
+				if nb, err := json.MarshalIndent(m, "", "  "); err == nil {
+					os.WriteFile(filepath.Join(dir, "meta.json"), append(nb, '\n'), 0o644)
+				}
+			}
+		}
+	}
 	code, err := os.ReadFile(filepath.Join(dir, m.File))
 	if err != nil {
 		return nil, "", err
 	}
 	return &m, string(code), nil
+}
+
+// paramNames extracts argument names from the problem's metaData JSON.
+// Class/design problems have no "params" and yield nil.
+func paramNames(raw string) []string {
+	var md struct {
+		Params []struct {
+			Name string `json:"name"`
+		} `json:"params"`
+	}
+	if json.Unmarshal([]byte(raw), &md) != nil {
+		return nil
+	}
+	var out []string
+	for _, p := range md.Params {
+		out = append(out, p.Name)
+	}
+	return out
+}
+
+// splitCases groups input lines (one line per argument) into test cases.
+// Returns nil when the line count does not divide evenly by len(params).
+func splitCases(params []string, input string) [][]string {
+	input = strings.TrimRight(strings.ReplaceAll(input, "\r\n", "\n"), "\n")
+	if len(params) == 0 || input == "" {
+		return nil
+	}
+	lines := strings.Split(input, "\n")
+	if len(lines)%len(params) != 0 {
+		return nil
+	}
+	var cases [][]string
+	for i := 0; i < len(lines); i += len(params) {
+		cases = append(cases, lines[i:i+len(params)])
+	}
+	return cases
+}
+
+func labelCase(params, vals []string, indent string) string {
+	var sb strings.Builder
+	for i, v := range vals {
+		fmt.Fprintf(&sb, "%s%s = %s\n", indent, params[i], v)
+	}
+	return sb.String()
+}
+
+func printCases(params []string, input string, got, want []string) {
+	cases := splitCases(params, input)
+	if cases == nil || len(got) != len(cases) || len(want) != len(cases) {
+		fmt.Printf("Output:   %s\n", strings.Join(got, " | "))
+		fmt.Printf("Expected: %s\n", strings.Join(want, " | "))
+		return
+	}
+	for i, c := range cases {
+		verdict := "PASS"
+		if got[i] != want[i] {
+			verdict = "FAIL"
+		}
+		fmt.Printf("\nCase %d: %s\n%s", i+1, verdict, labelCase(params, c, "  "))
+		fmt.Printf("  output   = %s\n  expected = %s\n", got[i], want[i])
+	}
+	fmt.Println()
 }
 
 // flex decodes a JSON string, array of strings, or null into a string.
@@ -371,10 +465,10 @@ func printErrors(r *checkResult) bool {
 func cmdTest(args []string) error {
 	fs := flag.NewFlagSet("test", flag.ExitOnError)
 	tc := fs.String("t", "", "testcases file (default: <dir>/testcases.txt)")
-	fs.Parse(args)
+	pos := parseInterleaved(fs, args)
 	dir := "."
-	if fs.NArg() > 0 {
-		dir = fs.Arg(0)
+	if len(pos) > 0 {
+		dir = pos[0]
 	}
 	m, code, err := loadMeta(dir)
 	if err != nil {
@@ -415,8 +509,7 @@ func cmdTest(args []string) error {
 	want := trimTrailingEmpty(r.ExpectedCodeAns)
 	fmt.Printf("Status:   %s\n", r.StatusMsg)
 	fmt.Printf("Runtime:  %s\n", r.StatusRuntime)
-	fmt.Printf("Output:   %s\n", strings.Join(got, " | "))
-	fmt.Printf("Expected: %s\n", strings.Join(want, " | "))
+	printCases(m.Params, string(tests), got, want)
 	if s := strings.Join(trimTrailingEmpty(r.StdOutputList), " | "); s != "" {
 		fmt.Printf("Stdout:   %s\n", s)
 	}
@@ -470,7 +563,11 @@ func cmdSubmit(args []string) error {
 	fmt.Printf("Runtime: %s\nMemory:  %s\n", r.StatusRuntime, r.StatusMemory)
 	if r.StatusMsg != "Accepted" {
 		if r.LastTestcase != "" {
-			fmt.Printf("Failed input:\n%s\n", r.LastTestcase)
+			if cs := splitCases(m.Params, string(r.LastTestcase)); len(cs) == 1 {
+				fmt.Printf("Failed input:\n%s", labelCase(m.Params, cs[0], "  "))
+			} else {
+				fmt.Printf("Failed input:\n%s\n", r.LastTestcase)
+			}
 		}
 		fmt.Printf("Output:   %s\nExpected: %s\n", r.CodeOutput, r.ExpectedOutput)
 		os.Exit(1)
